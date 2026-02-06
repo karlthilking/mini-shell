@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+#include <err.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <assert.h>
@@ -14,16 +15,26 @@
 #include <stdint.h>
 
 #define BUFSIZE         128
-#define FILENAME_LEN    64
 #define MAXARGS         32
 #define RD_PIPE         0
 #define WR_PIPE         1
+/* task options so task.opt is either 0 or the logical or of one or more options */
 #define OPT_PIPERD      1   // reads from pipe
 #define OPT_PIPEWR      2   // writes to pipe
 #define OPT_BGTASK      4   // background task
 #define OPT_RDROUT      8   // redirected output
 #define OPT_RDRIN       16  // redirected input
+/* indices reserved for specific purposes in fd array in spawn_tasks */
+#define IX_PIPERD       0   // index for pipe reader fd
+#define IX_PIPEWR       1   // index for pipe writer fd
+#define IX_RDROUT       2   // index for redirected output fd
+#define IX_RDRIN        3   // index for redirected input fd
 #define MAX_BG_TASKS    32
+#define PIPE_UNUSED     0   // if pipefd1 and pipefd2 are not used/valid fds
+#define PIPE_USED1      1   // if pipefd1 is being used
+#define PIPE_USED2      2   // if pipefd2 is being used
+#define PIPE_READ1      4   // if child process has to read and write using pipes, this
+                            // flag indicates if they should use pipe1 for reading
 
 // shell child process/task struct
 typedef struct task_t {
@@ -92,10 +103,6 @@ sig_handler(int sig)
 {
     pid_t pid, bg_id;
     switch (sig) {
-        case SIGUSR1:
-            if (setcontext(&uc) < 0)
-                perror("setcontext");
-            return;
         case SIGINT:
             putchar('\n');
             if (setcontext(&uc) < 0)
@@ -166,8 +173,35 @@ parse_command(char *cmd, task_t tasks[], int ntasks)
                     ;
                 prev = cur;
                 continue;
-            } else if (cmd[cur] == '|' || cmd[cur] == '&' ||
-                       cmd[cur] == '>' || cmd[cur] == '<') {
+            } else if (cmd[cur] == '>' || cmd[cur] == '<') {
+                if (prev < cur)
+                    tasks[tn].argv[argc++] = strndup(cmd + prev, cur - prev);
+                switch (cmd[cur]) {
+                    case '>':
+                        tasks[tn].opt |= OPT_RDROUT;
+                        break;
+                    case '<':
+                        tasks[tn].opt |= OPT_RDRIN;
+                        break;
+                }
+                while (cmd[++cur] == ' ')
+                    ;
+                prev = cur;
+                while (!(cmd[cur] == ' ' || cmd[cur] == '\n' ||
+                         cmd[cur] == '|' || cmd[cur] == '&' ||
+                         cmd[cur] == '<' || cmd[cur] == '>')) {
+                    ++cur;
+                }
+                tasks[tn].filename = strndup(cmd + prev, cur - prev);
+                if (cmd[cur] == '\n')
+                    break;
+                else if (cmd[cur] != ' ')
+                    continue;
+                while (cmd[++cur] == ' ')
+                    ;
+                prev = cur;
+                continue;
+            } else if (cmd[cur] == '|' || cmd[cur] == '&') {
                 if (prev < cur)
                     tasks[tn].argv[argc++] = strndup(cmd + prev, cur - prev);
                 switch (cmd[cur]) {
@@ -183,28 +217,13 @@ parse_command(char *cmd, task_t tasks[], int ntasks)
                             tasks[tmp].opt |= OPT_BGTASK;
                         }
                         break;
-                    default:
-                        if (cmd[cur] == '>')
-                            tasks[tn].opt |= OPT_RDROUT;
-                        else
-                            tasks[tn].opt |= OPT_RDRIN;
-                        while (cmd[++cur] == ' ')
-                            ;
-                        prev = cur;
-                        while (!(cmd[cur] == ' ' || cmd[cur] == '\n' ||
-                                 cmd[cur] == '|' || cmd[cur] == '&' ||
-                                 cmd[cur] == '<' || cmd[cur] == '>')) {
-                            ++cur;
-                        }
-                        tasks[tn].filename = strndup(cmd + prev, cur - prev);
-                        break;
                 }
-                if (!(tasks[tn].opt & (OPT_RDROUT | OPT_RDRIN)))
-                    tasks[tn].filename = NULL;
                 while (cmd[++cur] == ' ')
                     ;
                 prev = cur;
                 tasks[tn].argv[argc] = NULL;
+                if (!(tasks[tn].opt & (OPT_RDRIN | OPT_RDROUT)))
+                    tasks[tn].filename = NULL;
                 break;
             }
             ++cur;
@@ -220,15 +239,36 @@ void
 spawn_tasks(task_t tasks[], int ntasks)
 {
     int pending = ntasks;
-    int rc, fd, id, pipefds[2];
+    int bgid, pipefd1[2], pipefd2[2], fds[4];
+    int pipe_status = PIPE_UNUSED;
     while (pending--) {
         if (tasks[pending].opt & OPT_PIPERD) {
-            if (pipe(pipefds) < 0) {
-               fprintf(stderr, "pipe: %s %s\n", tasks[pending].argv[0], 
-                       tasks[pending - 1].argv[0]);
-               --pending;
-               continue;
+            if (pipe_status == PIPE_UNUSED || pipe_status & PIPE_USED2) {
+                assert(!(pipe_status & PIPE_USED1));
+                if (pipe(pipefd1) < 0 || fcntl(pipefd1[0], F_SETFD, FD_CLOEXEC) < 0 ||
+                    fcntl(pipefd1[1], F_SETFD, FD_CLOEXEC) < 0) {
+                    fprintf(stderr, "pipe %s %s: %s\n", 
+                            tasks[pending].argv[0],
+                            tasks[--pending].argv[0], 
+                            strerror(errno));
+                    continue;
+                }
+                // pipe1 is going to be used and this task is reading from it
+                pipe_status |= PIPE_USED1 | PIPE_READ1;
+            } else {
+                assert(!(pipe_status & PIPE_USED2) && (pipe_status & PIPE_USED1));
+                if (pipe(pipefd2) < 0 || fcntl(pipefd2[0], F_SETFD, FD_CLOEXEC) < 0 ||
+                    fcntl(pipefd2[1], F_SETFD, FD_CLOEXEC) < 0) {
+                    fprintf(stderr, "pipe %s %s: %s\n", 
+                            tasks[pending].argv[0], 
+                            tasks[--pending].argv[0], 
+                            strerror(errno));
+                    continue;
+                }
+                pipe_status |= PIPE_USED2;
             }
+            // if current task reads from a pipe, then it must be true that the next
+            // task is the one writing to same pipe
             assert(tasks[pending - 1].opt & OPT_PIPEWR);
         }
         tasks[pending].pid = fork();
@@ -238,57 +278,83 @@ spawn_tasks(task_t tasks[], int ntasks)
                 break;
             case 0:
                 signal(SIGINT, SIG_DFL);
-                rc = ~-1;
-                fd = ~-1;
                 if (tasks[pending].opt & OPT_PIPERD) {
-                    rc = close(STDIN_FILENO);
-                    fd = dup(pipefds[RD_PIPE]);
-                    close(pipefds[RD_PIPE]);
-                    close(pipefds[WR_PIPE]);
-                } else if (tasks[pending].opt & OPT_RDRIN) {
-                    fd = open(tasks[pending].filename, O_RDONLY);
-                    rc = close(STDIN_FILENO);
-                    dup2(fd, STDIN_FILENO);
-                } else if (tasks[pending].opt & OPT_PIPEWR) {
-                    rc = close(STDOUT_FILENO);
-                    fd = dup(pipefds[WR_PIPE]);
-                    close(pipefds[RD_PIPE]);
-                    close(pipefds[WR_PIPE]);
-                } else if (tasks[pending].opt & OPT_RDROUT) {
-                    fd = open(tasks[pending].filename, O_WRONLY | O_CREAT |
-                              O_TRUNC, S_IRWXU);
-                    rc = close(STDOUT_FILENO);
-                    dup2(fd, STDOUT_FILENO);
+                    if (pipe_status & PIPE_READ1) {
+                        if (dup2(pipefd1[RD_PIPE], STDIN_FILENO) < 0)
+                            err(EXIT_FAILURE, "dup2");
+                    } else if (dup2(pipefd2[RD_PIPE], STDIN_FILENO) < 0) {
+                        err(EXIT_FAILURE, "dup2");
+                    }
                 }
-                if (fd < 0 || rc < 0) {
-                    perror(tasks[pending].argv[0]);
-                    exit(EXIT_FAILURE);
+                if (tasks[pending].opt & OPT_PIPEWR) {
+                    if (!(pipe_status ^ (PIPE_USED1 | PIPE_USED2)) || 
+                        !(pipe_status & PIPE_USED2)) {
+                        if (dup2(pipefd1[WR_PIPE], STDOUT_FILENO) < 0)
+                            err(EXIT_FAILURE, "dup2");
+                    } else if (dup2(pipefd2[WR_PIPE], STDOUT_FILENO) < 0) {
+                        err(EXIT_FAILURE, "dup2");
+                    }
+                }
+                // dup2 automatically closes newfd (second argument) so 
+                // child processes that redirect input or output do not need
+                // to call close
+                if (tasks[pending].opt & OPT_RDRIN) {
+                    if ((fds[IX_RDRIN] = open(tasks[pending].filename,
+                                              O_RDONLY)) < 0) {
+                        err(EXIT_FAILURE, "open");
+                    }
+                    if (dup2(fds[IX_RDRIN], STDIN_FILENO) < 0)
+                        err(EXIT_FAILURE, "dup2");
+                }
+                if (tasks[pending].opt & OPT_RDROUT) {
+                    if ((fds[IX_RDROUT] = open(tasks[pending].filename,
+                                               O_WRONLY | O_CREAT | O_TRUNC, 
+                                               S_IRWXU)) < 0) {
+                        err(EXIT_FAILURE, "open");
+                    }
+                    if (dup2(fds[IX_RDROUT], STDOUT_FILENO) < 0)
+                        err(EXIT_FAILURE, "dup2");
                 }
                 if (execvp(tasks[pending].argv[0], tasks[pending].argv) < 0) {
                     perror(tasks[pending].argv[0]);
-                    kill(getppid(), SIGUSR1);
                     exit(EXIT_FAILURE);
                 }
             default:
                 if (tasks[pending].opt & OPT_BGTASK)
-                    if ((id = bg_list_add(&bg_list, tasks[pending].pid)) != -1)
-                        printf("[%d] %d\n", id, tasks[pending].pid);
+                    if ((bgid = bg_list_add(&bg_list, tasks[pending].pid)) != -1)
+                        printf("[%d] %d\n", bgid, tasks[pending].pid);
                 if (tasks[pending].opt & OPT_PIPEWR) {
-                    close(pipefds[RD_PIPE]);
-                    close(pipefds[WR_PIPE]);
+                    if (!(pipe_status ^ (PIPE_USED1 | PIPE_USED2)) ||
+                        !(pipe_status & PIPE_USED2)) {
+                        close(pipefd1[RD_PIPE]);
+                        close(pipefd1[WR_PIPE]);
+                        pipe_status ^= PIPE_USED1;
+                    } else {
+                        close(pipefd2[RD_PIPE]);
+                        close(pipefd2[WR_PIPE]);
+                        pipe_status ^= PIPE_USED2;
+                    }
                 }
+                if ((tasks[pending].opt & OPT_PIPERD) && (pipe_status & PIPE_READ1))
+                    pipe_status ^= PIPE_READ1;
                 break;
         }
     }
+    int wstatus;
     for (int i = 0; i < ntasks; ++i) {
         if (tasks[i].opt & OPT_BGTASK)
             continue;
-        if (waitpid(tasks[i].pid, NULL, 0) < 0)
+        if (waitpid(tasks[i].pid, &wstatus, 0) < 0)
             perror(tasks[i].argv[0]);
+        if (WIFEXITED(wstatus) && (WEXITSTATUS(wstatus) != 0))
+            printf("%s exit %d\n", tasks[i].argv[0], WEXITSTATUS(wstatus));
     }
     return;
 }
 
+// task argv strings and filenames (for tasks with input or output redirection) use
+// strndup to allocate these strings; strndup calls malloc internally so each string
+// must be freed before the task is deallocated
 void
 free_tasks(task_t tasks[], int ntasks)
 {
@@ -332,7 +398,6 @@ main(int argc, char *argv[])
 {
     memset((void *)&bg_list, 0, sizeof(bg_list));
     signal(SIGINT, sig_handler);
-    signal(SIGUSR1, sig_handler);
     run_shell();
     exit(0);
 }
