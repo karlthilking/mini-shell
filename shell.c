@@ -52,7 +52,7 @@ typedef struct bg_list_t {
 
 // globals
 bg_list_t bg_list;
-ucontext_t uc;
+static int recv_sigint; // 1: received SIGINT, 0: no signal
 
 int
 bg_list_remove(bg_list_t *bg_list, pid_t bg_pid)
@@ -100,17 +100,15 @@ bg_list_check(bg_list_t *bg_list)
     return;
 }
 
-void
-sig_handler(int sig)
+void *
+sighandler(int sig)
 {
-    pid_t pid, bg_id;
-    switch (sig) {
-        case SIGINT:
-            putchar('\n');
-            if (setcontext(&uc) < 0)
-                perror("setcontext");
-            return;
+    if (sig == SIGINT) {
+        printf("\n$ ");
+        fflush(stdout);
+        recv_sigint = 1;
     }
+    return NULL;
 }
 
 int
@@ -119,7 +117,7 @@ count_tasks(char *cmd)
     if (cmd[0] == '\n')
         return 0;
     int ntasks = 1;
-    for (int i = 0; i < strlen(cmd); ++i) {
+    for (size_t i = 0; i < strlen(cmd); ++i) {
         if (cmd[i] == '\n') {
             return ntasks;
         } else if (cmd[i] == '\'' || cmd[i] == '\"') {
@@ -143,7 +141,7 @@ count_tasks(char *cmd)
 int
 parse_command(char *cmd, task_t tasks[], int ntasks)
 {
-    int cur = 0, prev = 0, len = strlen(cmd);
+    int cur = 0, prev = 0;
     if (cmd[0] == ' ') {
         while (cmd[++cur] == ' ')
             ;
@@ -158,7 +156,7 @@ parse_command(char *cmd, task_t tasks[], int ntasks)
                 if (!(tasks[tn].opt & (OPT_RDROUT | OPT_RDRIN)))
                     tasks[tn].filename = NULL;
                 tasks[tn].argv[argc] = NULL;
-                goto success;
+                goto end;
             } else if (cmd[cur] == '\'' || cmd[cur] == '\"') {
                 char delim = (cmd[cur] == '\'') ? '\'' : '\"';
                 while (cmd[++cur] != delim)
@@ -231,10 +229,8 @@ parse_command(char *cmd, task_t tasks[], int ntasks)
             ++cur;
         }
     }
-    success:
+    end:
         return 0;
-    fail:
-        return -1;
 }
 
 void
@@ -251,8 +247,9 @@ spawn_tasks(task_t tasks[], int ntasks)
                     fcntl(pipefd1[1], F_SETFD, FD_CLOEXEC) < 0) {
                     fprintf(stderr, "pipe %s %s: %s\n", 
                             tasks[pending].argv[0],
-                            tasks[--pending].argv[0], 
+                            tasks[pending - 1].argv[0], 
                             strerror(errno));
+                    --pending;
                     continue;
                 }
                 // pipe1 is going to be used and this task is reading from it
@@ -263,8 +260,9 @@ spawn_tasks(task_t tasks[], int ntasks)
                     fcntl(pipefd2[1], F_SETFD, FD_CLOEXEC) < 0) {
                     fprintf(stderr, "pipe %s %s: %s\n", 
                             tasks[pending].argv[0], 
-                            tasks[--pending].argv[0], 
+                            tasks[pending - 1].argv[0], 
                             strerror(errno));
+                    --pending;
                     continue;
                 }
                 pipe_status |= PIPE_USED2;
@@ -341,6 +339,7 @@ spawn_tasks(task_t tasks[], int ntasks)
                     }
                     err(errno, tasks[pending].argv[0]);
                 }
+                break;
             default:
                 if (tasks[pending].opt & OPT_BGTASK)
                     if ((bgid = bg_list_add(&bg_list, tasks[pending].pid)) != -1)
@@ -399,20 +398,27 @@ void
 run_shell()
 {
     while (1) {
-        getcontext(&uc);
-        bg_list_check(&bg_list);
+        if (recv_sigint) {
+            recv_sigint = 0;
+        } else {
+            printf("$ ");
+            fflush(stdout);
+        }
+        if (bg_list.bg_task_count)
+            bg_list_check(&bg_list);
         char buf[BUFSIZE];
-        printf("$ ");
-        fflush(stdout);
         if (fgets(buf, BUFSIZE, stdin) == NULL && feof(stdin)) {
             putchar('\n');
             goto end;
         }
         int ntasks;
-        if ((ntasks = count_tasks(buf)) == 0)
+        if ((ntasks = count_tasks(buf)) == 0) {
+            if (recv_sigint)
+                recv_sigint = 0;
             continue;
+        }
         task_t tasks[ntasks];
-        memset(tasks, 0, sizeof(task_t) * ntasks);
+        memset((void *)tasks, 0, sizeof(task_t) * ntasks);
         if (parse_command(buf, tasks, ntasks) < 0)
             continue;
         spawn_tasks(tasks, ntasks);
@@ -423,10 +429,11 @@ run_shell()
 }
 
 int
-main(int argc, char *argv[])
+main(void)
 {
     memset((void *)&bg_list, 0, sizeof(bg_list));
-    signal(SIGINT, sig_handler);
+    recv_sigint = 0;
+    signal(SIGINT, (void *)&sighandler);
     run_shell();
     exit(0);
 }
