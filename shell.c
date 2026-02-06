@@ -80,24 +80,31 @@ bg_list_add(bg_list_t *bg_list, pid_t bg_pid)
     return -1;
 }
 
-void
+// check to see if any background tasks have completed, if so, report
+// exit info
+int
 bg_list_check(bg_list_t *bg_list)
 {
     pid_t bg_pid;
     int id, rc, wstatus;
+    int removed = 0;
     for (int i = 0; i < MAX_BG_TASKS; ++i) {
-        if (((bg_pid = waitpid(bg_list->bg_tasks[i], &wstatus, WNOHANG)) > 0) &&
+        if ((bg_pid = waitpid(bg_list->bg_tasks[i], &wstatus, WNOHANG)) > 0 &&
             ((id = bg_list_remove(bg_list, bg_pid))) != -1) {
+            if (!removed)
+                putchar('\n');
             if (WIFEXITED(wstatus) && ((rc = WEXITSTATUS(wstatus))) != 0) {
                 if (rc == ENOENT || rc == EBADF || rc == EACCES)
                     continue;
                 printf("[%d] %d exit %d\n", id, bg_pid, rc);
+                ++removed;
             } else {
                 printf("[%d] %d done\n", id, bg_pid);
+                ++removed;
             }
         }
     }
-    return;
+    return removed;
 }
 
 void *
@@ -404,8 +411,10 @@ run_shell()
             printf("$ ");
             fflush(stdout);
         }
-        if (bg_list.bg_task_count)
-            bg_list_check(&bg_list);
+        if (bg_list.bg_task_count && bg_list_check(&bg_list) > 0) {
+            printf("$ ");
+            fflush(stdout);
+        }
         char buf[BUFSIZE];
         if (fgets(buf, BUFSIZE, stdin) == NULL && feof(stdin)) {
             putchar('\n');
@@ -413,6 +422,11 @@ run_shell()
         }
         int ntasks;
         if ((ntasks = count_tasks(buf)) == 0) {
+            // when recv_sigint is 1 (SIGINT was received) typically the
+            // shell should not print reprompt because the sighandler will
+            // handle the reprompt, but if a user sends a interrupt followed
+            // by a newline (ntasks == 0), the shell will hang and not
+            // reprompt so when ntasks == 0 toggle recv_sigint off anyways
             if (recv_sigint)
                 recv_sigint = 0;
             continue;
