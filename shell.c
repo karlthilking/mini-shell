@@ -161,7 +161,7 @@ parse_command(char *cmd, task_t tasks[], int ntasks)
                 if (!(tasks[tn].opt & (OPT_RDROUT | OPT_RDRIN)))
                     tasks[tn].filename = NULL;
                 tasks[tn].argv[argc] = NULL;
-                goto end;
+                return 0;
             } else if (cmd[cur] == '\'' || cmd[cur] == '\"') {
                 char delim = (cmd[cur] == '\'') ? '\'' : '\"';
                 while (cmd[++cur] != delim)
@@ -234,8 +234,7 @@ parse_command(char *cmd, task_t tasks[], int ntasks)
             ++cur;
         }
     }
-    end:
-        return 0;
+    return 0;
 }
 
 void
@@ -248,7 +247,8 @@ spawn_tasks(task_t tasks[], int ntasks)
         if (tasks[pending].opt & OPT_PIPERD) {
             if (pipe_status == PIPE_UNUSED || pipe_status & PIPE_USED2) {
                 assert(!(pipe_status & PIPE_USED1));
-                if (pipe(pipefd1) < 0 || fcntl(pipefd1[0], F_SETFD, FD_CLOEXEC) < 0 ||
+                if (pipe(pipefd1) < 0 || 
+                    fcntl(pipefd1[0], F_SETFD, FD_CLOEXEC) < 0 ||
                     fcntl(pipefd1[1], F_SETFD, FD_CLOEXEC) < 0) {
                     fprintf(stderr, "pipe %s %s: %s\n", 
                             tasks[pending].argv[0],
@@ -260,8 +260,10 @@ spawn_tasks(task_t tasks[], int ntasks)
                 // pipe1 is going to be used and this task is reading from it
                 pipe_status |= PIPE_USED1 | PIPE_READ1;
             } else {
-                assert(!(pipe_status & PIPE_USED2) && (pipe_status & PIPE_USED1));
-                if (pipe(pipefd2) < 0 || fcntl(pipefd2[0], F_SETFD, FD_CLOEXEC) < 0 ||
+                assert(!(pipe_status & PIPE_USED2) &&
+                        (pipe_status & PIPE_USED1));
+                if (pipe(pipefd2) < 0 || 
+                    fcntl(pipefd2[0], F_SETFD, FD_CLOEXEC) < 0 ||
                     fcntl(pipefd2[1], F_SETFD, FD_CLOEXEC) < 0) {
                     fprintf(stderr, "pipe %s %s: %s\n", 
                             tasks[pending].argv[0], 
@@ -272,8 +274,8 @@ spawn_tasks(task_t tasks[], int ntasks)
                 }
                 pipe_status |= PIPE_USED2;
             }
-            // if current task reads from a pipe, then it must be true that the next
-            // task is the one writing to same pipe
+            // if current task reads from a pipe, then it must be true that 
+            // the next task is the one writing to same pipe
             assert(tasks[pending - 1].opt & OPT_PIPEWR);
         }
         tasks[pending].pid = fork();
@@ -323,9 +325,10 @@ spawn_tasks(task_t tasks[], int ntasks)
                         err(errno, "dup2");
                 }
                 if (execvp(tasks[pending].argv[0], tasks[pending].argv) < 0) {
-                    // if execvp fails then the FD_CLOEXEC flag does not do anything
-                    // (the fd is left open) so the child process is reponsible for
-                    // closing any of its fds before reporting the error
+                    // if execvp fails then the FD_CLOEXEC flag does not do 
+                    // anything (the fd is left open) so the child process is 
+                    // reponsible for closing any of its fds before reporting 
+                    // the error
                     if (tasks[pending].opt & OPT_RDRIN) {
                         close(fds[IX_RDRIN]);
                     } else if (tasks[pending].opt & OPT_RDROUT) {
@@ -346,9 +349,10 @@ spawn_tasks(task_t tasks[], int ntasks)
                 }
                 break;
             default:
-                if (tasks[pending].opt & OPT_BGTASK)
-                    if ((bgid = bg_list_add(&bg_list, tasks[pending].pid)) != -1)
+                if (tasks[pending].opt & OPT_BGTASK) {
+                    if ((bgid = bg_list_add(&bg_list, tasks[pending].pid)) > 0)
                         printf("[%d] %d\n", bgid, tasks[pending].pid);
+                }
                 if (tasks[pending].opt & OPT_PIPEWR) {
                     if (!(pipe_status ^ (PIPE_USED1 | PIPE_USED2)) ||
                         !(pipe_status & PIPE_USED2)) {
@@ -361,8 +365,10 @@ spawn_tasks(task_t tasks[], int ntasks)
                         pipe_status ^= PIPE_USED2;
                     }
                 }
-                if ((tasks[pending].opt & OPT_PIPERD) && (pipe_status & PIPE_READ1))
+                if ((tasks[pending].opt & OPT_PIPERD) &&
+                    (pipe_status & PIPE_READ1)) {
                     pipe_status ^= PIPE_READ1;
+                }
                 break;
         }
     }
@@ -373,10 +379,10 @@ spawn_tasks(task_t tasks[], int ntasks)
         if (waitpid(tasks[i].pid, &wstatus, 0) < 0)
             perror(tasks[i].argv[0]);
         if (WIFEXITED(wstatus) && ((rc = WEXITSTATUS(wstatus))) != 0) {
-            // child processes that fail before exec or from exec return the current errno
-            // so an exit status of ENOENT and EBADF indicate that the program was never
-            // executed; thus, don't report the exit status of a child process than never
-            // started execution
+            // child processes that fail before exec or from exec return the 
+            // current errno so an exit status of ENOENT and EBADF indicate 
+            // that the program was never executed; thus, don't report the 
+            // exit status of a child process than never started execution
             if (rc == ENOENT || rc == EBADF || rc == EACCES)
                 continue;
             printf("%s exit %d\n", tasks[i].argv[0], WEXITSTATUS(wstatus));
@@ -385,9 +391,9 @@ spawn_tasks(task_t tasks[], int ntasks)
     return;
 }
 
-// task argv strings and filenames (for tasks with input or output redirection) use
-// strndup to allocate these strings; strndup calls malloc internally so each string
-// must be freed before the task is deallocated
+// task argv strings and filenames (if task is redirecting input or output) 
+// use strndup which uses malloc internally so each string must be freed
+// before the tasks gets deallocated
 void
 free_tasks(task_t tasks[], int ntasks)
 {
@@ -416,7 +422,7 @@ run_shell()
         char buf[BUFSIZE];
         if (fgets(buf, BUFSIZE, stdin) == NULL && feof(stdin)) {
             putchar('\n');
-            goto end;
+            return;
         }
         int ntasks;
         if ((ntasks = count_tasks(buf)) == 0) {
@@ -436,8 +442,6 @@ run_shell()
         spawn_tasks(tasks, ntasks);
         free_tasks(tasks, ntasks);
     }
-    end:
-        return;
 }
 
 int
